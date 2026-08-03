@@ -1,4 +1,4 @@
-import React, { type ChangeEvent, useEffect, useState } from 'react';
+import React, { type ChangeEvent, useEffect, useMemo, useState } from 'react';
 import classNames from 'classnames';
 import {
   Button,
@@ -31,7 +31,6 @@ import {
   useStockOperationTypes,
   useStockTagLocations,
   useUser,
-  useUsers,
 } from '../../stock-lookups/stock-lookups.resource';
 import { ResourceRepresentation } from '../../core/api/api';
 import { type UserRoleScope } from '../../core/api/types/identity/UserRoleScope';
@@ -53,6 +52,8 @@ import { type Role } from '../../core/api/types/identity/Role';
 import { type StockOperationType } from '../../core/api/types/stockOperation/StockOperationType';
 import { type User } from '../../core/api/types/identity/User';
 import { handleMutate } from '../../utils';
+import useSearchUser from '../../stock-operations/stock-operations-forms/hooks/useSearchUser';
+import { useDebounce } from '../../core/hooks/debounce-hook';
 import styles from './add-stock-user-role-scope.scss';
 
 const MinDate: Date = today();
@@ -80,10 +81,26 @@ const AddStockUserRoleScope: React.FC<AddStockUserRoleScopeProps> = ({ model, ed
     isLoading,
   } = useStockOperationTypes();
 
-  // get users
-  const { items: users, isLoading: loadingUsers } = useUsers({
-    v: ResourceRepresentation.Default,
-  });
+  // Server-side user search (fixes O3-4518: systems with many users)
+  const { userList, setSearchString, isLoading: loadingUsers } = useSearchUser();
+
+  const debouncedSearch = useDebounce((query: string) => {
+    setSearchString(query?.trim() || null);
+  }, 1000);
+
+  // Stabilize the items list — only update when not loading to prevent flicker
+  const [stableUserList, setStableUserList] = useState(userList ?? []);
+
+  useEffect(() => {
+    if (!loadingUsers && userList) {
+      setStableUserList(userList);
+    }
+  }, [userList, loadingUsers]);
+
+  const usersResults = useMemo(
+    () => stableUserList.filter((item) => item.uuid !== loggedInUserUuid),
+    [stableUserList, loggedInUserUuid],
+  );
 
   // get roles
   const { isLoading: loadingRoles } = useRoles({
@@ -109,31 +126,11 @@ const AddStockUserRoleScope: React.FC<AddStockUserRoleScopeProps> = ({ model, ed
     });
   };
 
-  const [filteredItems, setFilteredItems] = useState<unknown[]>([]);
-
-  const usersResults = users?.results ?? [];
-
-  const filterItems = (query: string) => {
-    if (query && query.trim() !== '') {
-      const filtered = usersResults
-        .filter((item: any) => item.uuid !== loggedInUserUuid)
-        .filter((item: any) => {
-          const displayName = item?.person?.display ?? item?.display ?? '';
-          return displayName?.toLowerCase().includes(query?.toLowerCase());
-        });
-      setFilteredItems(filtered);
-    }
-  };
-
   useEffect(() => {
     if (model?.userUuid) {
       setSelectedUserUuid(model.userUuid);
     }
   }, [model]);
-
-  const handleSearchQueryChange = (query: string) => {
-    filterItems(query);
-  };
 
   const onStockOperationTypeChanged = (event: React.ChangeEvent<HTMLInputElement>): void => {
     const operationType = formModel?.operationTypes?.find((x) => x.operationTypeUuid === event?.target?.value);
@@ -221,8 +218,29 @@ const AddStockUserRoleScope: React.FC<AddStockUserRoleScopeProps> = ({ model, ed
   const addStockUserRole = async (e) => {
     e.preventDefault();
 
+    // Validation: ensure required fields are present
+    if (!formModel?.userUuid) {
+      showSnackbar({
+        title: t('errorSavingUserRoleScope', 'Error Saving user role scope'),
+        kind: 'error',
+        isLowContrast: true,
+        subtitle: t('userRequired', 'User is required'),
+      });
+      return;
+    }
+
+    if (!formModel?.role) {
+      showSnackbar({
+        title: t('errorSavingUserRoleScope', 'Error Saving user role scope'),
+        kind: 'error',
+        isLowContrast: true,
+        subtitle: t('roleRequired', 'Role is required'),
+      });
+      return;
+    }
+
     createOrUpdateUserRoleScope(formModel).then(
-      () => {
+      (response) => {
         handleMutate(`${restBaseUrl}/stockmanagement/userrolescope`);
         showSnackbar({
           isLowContrast: true,
@@ -237,44 +255,40 @@ const AddStockUserRoleScope: React.FC<AddStockUserRoleScopeProps> = ({ model, ed
           title: t('errorSavingUserRoleScope', 'Error Saving user role scope'),
           kind: 'error',
           isLowContrast: true,
-          subtitle: err?.message,
+          subtitle: err?.message ?? err?.cause ?? t('unknownError', 'An unknown error occurred'),
         });
-
-        closeWorkspace();
       },
     );
   };
 
-  if (isLoading || loadingRoles || loadingUsers || isLoadingStockLocations) {
+  if (isLoading || loadingRoles || isLoadingStockLocations) {
     return (
       <InlineLoading status="active" iconDescription="Loading" description={t('loadingData', 'Loading data...')} />
     );
   }
 
   return (
-    <Form className={styles.container}>
+    <Form className={styles.container} onSubmit={addStockUserRole}>
       <Stack className={styles.form} gap={5}>
         <div>
-          {users?.results?.length > 0 && (
-            <FormGroup legendText={t('user', 'User')}>
-              <ComboBox
-                id="userName"
-                initialSelectedItem={usersResults.find((user) => user.uuid === model?.userUuid) ?? null}
-                items={filteredItems.length ? filteredItems : usersResults}
-                itemToString={(item) => {
-                  if (!item || typeof item !== 'object') return '';
-                  const itemWithPerson = item as { person?: { display?: string }; display?: string };
-                  return `${itemWithPerson?.person?.display ?? itemWithPerson?.display ?? ''}`;
-                }}
-                titleText={t('user', 'User')}
-                onChange={onUserChanged}
-                onInputChange={handleSearchQueryChange}
-                placeholder={t('filterUsers', 'Filter users')}
-                shouldFilterItem={() => true}
-                size="md"
-              />
-            </FormGroup>
-          )}
+          <FormGroup legendText={t('user', 'User')}>
+            <ComboBox
+              id="userName"
+              initialSelectedItem={usersResults.find((user) => user.uuid === model?.userUuid) ?? null}
+              items={usersResults}
+              itemToString={(item) => {
+                if (!item || typeof item !== 'object') return '';
+                const itemWithPerson = item as { person?: { display?: string }; display?: string };
+                return `${itemWithPerson?.person?.display ?? itemWithPerson?.display ?? ''}`;
+              }}
+              titleText={t('user', 'User')}
+              onChange={onUserChanged}
+              onInputChange={debouncedSearch}
+              placeholder={t('searchUsers', 'Search users')}
+              shouldFilterItem={() => true}
+              size="md"
+            />
+          </FormGroup>
         </div>
         <Select
           id="select-role"
